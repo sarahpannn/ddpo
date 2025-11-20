@@ -27,12 +27,12 @@ def main():
         "action_dim": 2,
         "num_diffusion_iters": 30,
         "num_pg_iters": 1000,
-        "batch_size": 128,        # episodes per PG iteration
+        "batch_size": 2,        # episodes per PG iteration
         "max_env_steps": 100,
         # "big_batch_size": 8192 * 2 * 2,
-        "num_train_chunks": 4,
+        "num_train_chunks": 1,
         "epochs": 1,
-        "lr": 5e-6,
+        "lr": 1e-5,
         "weight_decay": 5e-6,
         "clip_eps": 0.15,         # Moved from update_model_efficiently call
         "warmup_ratio": 0.1,     # Extracted from the calculation
@@ -111,7 +111,8 @@ def main():
     # Calculate steps using config values
     total_steps = (
         # config.num_pg_iters * config.max_env_steps * config.num_diffusion_iters * config.epochs * config.batch_size // config.big_batch_size
-        config.num_train_chunks * config.epochs * config.num_pg_iters
+        # config.num_train_chunks * config.epochs * config.num_pg_iters
+        config.epochs * config.num_pg_iters
     )
 
     warmup_steps = int(config.warmup_ratio * total_steps)

@@ -105,14 +105,26 @@ def compute_posterior_mean_var(
 
 def analytical_kl(mean1, var1, mean2, var2):
     """KL(N(mean1, var1) || N(mean2, var2))"""
-    # var is diagonal, so we sum over dimensions
-    numerator = (mean1 - mean2)**2 + var1 - var2
-    denominator = 2 * var2
-    # Log variance ratio (var1 / var2)
-    log_ratio = torch.log(var2) - torch.log(var1) 
+    # FIX: Correct KL formula for multivariate Gaussians with diagonal covariance
+    # Ensure numerical stability
+    var1 = torch.clamp(var1, min=1e-8)
+    var2 = torch.clamp(var2, min=1e-8)
     
-    kl = 0.5 * (log_ratio + numerator / denominator - 1)
-    return kl.sum(dim=-1).mean()
+    # log_ratio = log(var2 / var1)
+    log_ratio = torch.log(var2) - torch.log(var1)
+    
+    # Squared difference of means divided by var2
+    t1 = (mean1 - mean2).pow(2) / var2
+    
+    # Variance ratio
+    t2 = var1 / var2
+    
+    # Correct Formula: 0.5 * (log_ratio - 1 + var_ratio + mean_diff_term)
+    # The -1 is per dimension, so we sum over dimensions then average over batch
+    kl_per_dim = 0.5 * (log_ratio - 1 + t2 + t1)
+    
+    # Sum over all non-batch dimensions (flatten from dim 1 onwards and sum)
+    return kl_per_dim.flatten(start_dim=1).sum(dim=1).mean()
 
 
 # ---------------------------------------------------------------------------
@@ -124,7 +136,7 @@ def rollout_ddpo_collect_flat(
     model,
     noise_scheduler,
     stats,
-    episode_idx: int,   # interpreted as "episode_start_idx" for vec env
+    episode_idx: int,
     obs_horizon,
     pred_horizon,
     action_horizon,
@@ -132,40 +144,25 @@ def rollout_ddpo_collect_flat(
     device,
     max_env_steps=100,
 ):
-    """
-    Parallel DDPO rollout over a VectorEnv.
-
-    env: VectorEnv with env.num_envs environments.
-    Returns:
-        trajectory_data: list of dicts, each with keys:
-            - 'latents':      x_t          (tensor, shape [1, pred_horizon, action_dim], CPU)
-            - 't':            timestep int
-            - 'cond':         obs_cond     (tensor, shape [1, obs_horizon*obs_dim], CPU)
-            - 'next_latents': x_{t-1}      (tensor, shape [1, pred_horizon, action_dim], CPU)
-            - 'episode_idx':  int in [episode_idx, episode_idx + num_envs)
-        final_rewards: np.ndarray of shape (num_envs,) with total reward per env
-    """
     vec_env = env
     num_envs = vec_env.num_envs
     action_dim = vec_env.single_action_space.shape[0]
 
     trajectory_data = []
 
-    # Track rewards per env
+    # Track rewards
     current_rewards = np.zeros(num_envs, dtype=np.float32)
     final_rewards = np.zeros(num_envs, dtype=np.float32)
     active_envs = np.ones(num_envs, dtype=bool)
 
-    # ===== Reset all envs (no grad) =====
+    # Reset envs
     with torch.no_grad():
-        obs, infos = vec_env.reset()  # obs: (num_envs, obs_dim)
-
-    # Initialize history: (num_envs, obs_horizon, obs_dim)
+        obs, infos = vec_env.reset()
+    
     obs_history = np.tile(obs[:, None, :], (1, obs_horizon, 1))
-
     step_idx = 0
 
-    # Move scheduler buffers to device once
+    # Move scheduler buffers once
     with torch.no_grad():
         noise_scheduler.alphas_cumprod = noise_scheduler.alphas_cumprod.to(device)
         noise_scheduler.alphas = noise_scheduler.alphas.to(device)
@@ -177,78 +174,88 @@ def rollout_ddpo_collect_flat(
             break
 
         with torch.no_grad():
-            # ===== Build conditioning for all envs =====
+            # --- Prepare Conditioning ---
             nobs = normalize_data(obs_history, stats=stats["obs"])
             nobs_t = torch.from_numpy(nobs).to(device, dtype=torch.float32)
-            obs_cond = nobs_t.flatten(start_dim=1)  # (num_envs, obs_horizon * obs_dim)
-
-            if torch.isnan(nobs_t).any():
-                print("NaNs in normalized obs")
+            obs_cond = nobs_t.flatten(start_dim=1)
 
             B = num_envs
 
-            # Initial noisy actions x_T: (num_envs, pred_horizon, action_dim)
-            naction = torch.randn(
-                (B, pred_horizon, action_dim),
-                device=device,
-            )
+            # --- Pre-allocate Trajectory Storage on GPU ---
+            # We store: [num_steps, B, ...] to avoid appending in loop
+            # This uses VRAM, but for standard diffusion horizons (e.g. 100) it's negligible.
+            traj_latents = torch.zeros((num_diffusion_iters, B, pred_horizon, action_dim), device=device)
+            traj_next_latents = torch.zeros((num_diffusion_iters, B, pred_horizon, action_dim), device=device)
+            traj_timesteps = torch.zeros((num_diffusion_iters,), device=device, dtype=torch.long)
 
-            # Init diffusion timesteps
+            # Initial noise
+            naction = torch.randn((B, pred_horizon, action_dim), device=device)
             noise_scheduler.set_timesteps(num_diffusion_iters, device=device)
 
-            # ===== Diffusion denoising loop, record all transitions =====
-            for k in noise_scheduler.timesteps:
+            # --- FAST Diffusion Loop (Pure GPU) ---
+            # No .cpu() calls allowed here!
+            for idx, k in enumerate(noise_scheduler.timesteps):
                 naction = naction.detach()
-
                 t = torch.full((B,), k, device=device, dtype=torch.long)
-                t_int = int(k)
+                
+                # Record current state and time
+                traj_latents[idx] = naction
+                traj_timesteps[idx] = k
 
-                # Forward pass (no grad)
+                # Forward pass
                 noise_pred = model(
                     sample=naction,
-                    timestep=t_int,
+                    timestep=int(k),
                     global_cond=obs_cond,
                 )
 
-                # Sample x_{t-1}
+                # Scheduler step
                 step_out = noise_scheduler.step(
                     model_output=noise_pred,
-                    timestep=t_int,
+                    timestep=int(k),
                     sample=naction,
                 )
                 naction_next = step_out.prev_sample
+                
+                # Record next state
+                traj_next_latents[idx] = naction_next
+                
+                # Update for next loop
+                naction = naction_next
 
-                # Store this diffusion transition on CPU, one entry per *active* env
-                naction_cpu = naction.detach().cpu()
-                cond_cpu = obs_cond.detach().cpu()
-                next_latents_cpu = naction_next.detach().cpu()
+            # --- Bulk Transfer & Formatting (CPU Side) ---
+            # Now we move everything to CPU once. 
+            # This incurs only ONE synchronization overhead per env step.
+            all_latents_cpu = traj_latents.cpu()            # (T, B, ...)
+            all_next_latents_cpu = traj_next_latents.cpu()  # (T, B, ...)
+            all_timesteps_cpu = traj_timesteps.cpu()        # (T,)
+            cond_cpu = obs_cond.cpu()                       # (B, ...)
 
+            # Unroll into the list-of-dicts format required by DDPO
+            # We iterate over the diffusion steps (T) and batch (B)
+            # This is fast because it's pure RAM operations now, no PCIe waits.
+            for t_idx in range(num_diffusion_iters):
+                t_val = int(all_timesteps_cpu[t_idx])
                 for i in range(num_envs):
                     if active_envs[i]:
                         trajectory_data.append({
-                            "latents": naction_cpu[i:i+1],
-                            "t": t_int,
+                            "latents": all_latents_cpu[t_idx, i:i+1],
+                            "t": t_val,
                             "cond": cond_cpu[i:i+1],
-                            "next_latents": next_latents_cpu[i:i+1],
+                            "next_latents": all_next_latents_cpu[t_idx, i:i+1],
                             "episode_idx": episode_idx + i,
                         })
 
-                naction = naction_next
-
-            # ===== Decode final clean actions and step envs =====
-            naction_np = naction.detach().cpu().numpy()  # (num_envs, pred_horizon, action_dim)
+            # --- Environment Execution (Same as before) ---
+            naction_np = naction.detach().cpu().numpy()
             action_pred = unnormalize_data(naction_np, stats=stats["action"])
-
-            # Take first action_horizon actions
+            
             start = obs_horizon - 1
             end = start + action_horizon
-            action_seq = action_pred[:, start:end, :]  # (num_envs, action_horizon, action_dim)
+            action_seq = action_pred[:, start:end, :]
 
-            # Execute action_horizon env steps
             for ah in range(action_seq.shape[1]):
                 step_actions = action_seq[:, ah, :]
-
-                # Zero out actions for inactive envs to avoid weird extra stepping
                 masked_actions = step_actions.copy()
                 masked_actions[~active_envs] = 0.0
 
@@ -258,11 +265,8 @@ def rollout_ddpo_collect_flat(
                 for i in range(num_envs):
                     if active_envs[i]:
                         current_rewards[i] += rewards[i]
-
-                        # Shift history and append new obs
                         obs_history[i] = np.roll(obs_history[i], -1, axis=0)
                         obs_history[i, -1] = next_obs[i]
-
                         if dones[i] or step_idx + 1 >= max_env_steps:
                             active_envs[i] = False
                             final_rewards[i] = current_rewards[i]
@@ -321,6 +325,8 @@ def update_model_efficiently(
     adv_per_episode = (returns - returns.mean()) / (returns.std() + 1e-8)  # (E,)
     advantages = adv_per_episode[episode_indices]                           # (N,)
     advantages = advantages.detach()
+    # FIX: Additional clipping for stability
+    advantages = torch.clamp(advantages, -5.0, 5.0)
 
     # ---- 2. Ensure scheduler buffers on device ----
     noise_scheduler.alphas_cumprod = noise_scheduler.alphas_cumprod.to(device)
@@ -397,11 +403,14 @@ def update_model_efficiently(
             # --- PPO clipped objective ---
             log_ratio = new_log_probs - b_old_log_probs           # (B,)
             log_ratio = torch.nan_to_num(log_ratio, nan=0.0)
+            # FIX: More aggressive clamping for improved stability
+            log_ratio = torch.clamp(log_ratio, -2.0, 2.0)
             if (log_ratio.abs() > 5).any():
                 print("Warning: unstable log_ratio in PPO update, using clamped version")
                 stable_log_ratio = torch.clamp(log_ratio, -5, 5)
                 ratio = torch.exp(stable_log_ratio)
-            else: ratio = torch.exp(log_ratio)                          # (B,)
+            else: 
+                ratio = torch.exp(log_ratio)                          # (B,)
 
             wandb.log({
                 "stability/log_ratio_mean": log_ratio.mean().item(),
@@ -425,11 +434,11 @@ def update_model_efficiently(
             loss = -torch.min(surr1, surr2).mean()
 
             loss_kl = analytical_kl(
-                mean1=mu_t_old[idx],
-                var1=var_t_old[idx],
-                mean2=mu_t,
-                var2=var_t,
-            ).mean() * 10
+                mean1=mu_t.detach(),  # FIX: Use current batch mu_t as reference (detached)
+                var1=var_t.detach(),   # FIX: Use current batch var_t as reference (detached)
+                mean2=mu_t,            # New policy mean
+                var2=var_t,            # New policy var
+            ) * 0.1  # FIX: Reduce KL weight from 10 to 0.1
 
             total_kl += loss_kl.detach()
 
@@ -447,21 +456,19 @@ def update_model_efficiently(
 
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
 
-            optimizer.step()
-
-            if lr_scheduler is not None:
-                lr_scheduler.step()
+            optimizer.step()                
 
             total_loss_val += float(loss.item())
             num_batches += 1
 
             wandb.log({
-                "gradients/total_norm": total_norm, e
+                "gradients/total_norm": total_norm,
                 "global_step": global_step, 
             })
             global_step += 1
 
     avg_loss = total_loss_val / max(1, num_batches)
+    lr_scheduler.step()
     return avg_loss, total_kl.mean().item(), global_step
 
 
