@@ -1,0 +1,7 @@
+*.mp4
+archive/*
+wandb/*
+.ipynb_checkpoints/*
+__pycache__/*
+*.zip
+*.pth
