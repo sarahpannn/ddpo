@@ -632,67 +632,51 @@ class PushTEnv(gym.Env): # Changed from gym.Env to gymnasium.Env
 class PushTAdapter(gym.Env):
     """Adapts old PushTEnv to new Gymnasium API."""
     def __init__(self):
-        self.env = PushTEnv() # Initialize your custom class
-        # self.observation_space = self.env.observation_space
-        # self.action_space = self.env.action_space
+        super().__init__()
+        self.env = PushTEnv()
 
         old_obs = self.env.observation_space
         self.observation_space = gym.spaces.Box(
             low=old_obs.low,
             high=old_obs.high,
             shape=old_obs.shape,
-            dtype=old_obs.dtype
+            dtype=old_obs.dtype,
         )
 
-        # Fix Action Space
         old_act = self.env.action_space
         self.action_space = gym.spaces.Box(
             low=old_act.low,
             high=old_act.high,
             shape=old_act.shape,
-            dtype=old_act.dtype
+            dtype=old_act.dtype,
         )
 
-        # Gymnasium requires metadata for render modes
         self.metadata = {"render_modes": ["rgb_array"], "render_fps": 10}
 
     def reset(self, seed=None, options=None):
-        # handle seeding for both old and new gym
-        if seed is not None:
-            if hasattr(self.env, 'seed'):
-                self.env.seed(seed)
-
-        raw_ret = self.env.reset()
-
-        if isinstance(raw_ret, tuple):
-            obs = raw_ret[0]
-        else:
-            obs = raw_ret
-
-        # Force it to be a numpy array to satisfy the Box space
+        # Just pass the seed straight through
+        obs, info = self.env.reset(seed=seed, options=options)
         obs = np.array(obs, dtype=self.observation_space.dtype)
-
-        return obs, {}
+        return obs, info
 
     def step(self, action):
-        # CALL STEP
         raw_ret = self.env.step(action)
 
-        # FIX: Handle 4-value (old) or 5-value (new) returns
         if len(raw_ret) == 4:
             obs, reward, done, info = raw_ret
+            terminated = bool(done)
             truncated = False
         elif len(raw_ret) == 5:
             obs, reward, terminated, truncated, info = raw_ret
-            done = terminated or truncated
         else:
             raise ValueError(f"Env returned {len(raw_ret)} values, expected 4 or 5.")
 
-        # Force obs to numpy
         obs = np.array(obs, dtype=self.observation_space.dtype)
-
-        # Return 5 values for Gymnasium
-        return obs, reward, bool(done), bool(truncated), info
+        return obs, float(reward), bool(terminated), bool(truncated), info
 
     def render(self):
-        return self.env.render(mode='rgb_array')
+        return self.env.render(mode="rgb_array")
+
+    def close(self):
+        self.env.close()
+        super().close()

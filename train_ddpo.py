@@ -7,7 +7,7 @@ import os
 import random
 from gymnasium.vector import SyncVectorEnv
 from torch.optim.lr_scheduler import LambdaLR
-# from diffusers.schedulers.scheduling_ddim import DDIMScheduler
+from diffusers.schedulers.scheduling_ddim import DDIMScheduler
 from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
 
 from pusht_env import PushTAdapter, PushTEnv
@@ -25,23 +25,25 @@ def main():
         "action_horizon": 8,
         "obs_dim": 5,
         "action_dim": 2,
-        "num_diffusion_iters": 30,
+        "num_diffusion_iters": 15,
         "num_pg_iters": 1000,
-        "batch_size": 2,        # episodes per PG iteration
+        "batch_size": 128,        # episodes per PG iteration
         "max_env_steps": 100,
         # "big_batch_size": 8192 * 2 * 2,
         "num_train_chunks": 1,
         "epochs": 1,
-        "lr": 1e-5,
-        "weight_decay": 5e-6,
+        "lr": 2e-7,
+        "weight_decay": 1e-6,
         "clip_eps": 0.15,         # Moved from update_model_efficiently call
-        "warmup_ratio": 0.1,     # Extracted from the calculation
+        "warmup_ratio": 0.05,     # Extracted from the calculation
         "dataset_path": "pusht_cchi_v7_replay.zarr.zip",
         "seed": 42,
-        "load_pretrained": True
+        "load_pretrained": True,
+        "gradient_clip": 0.5,
     }
 
     # 2. Initialize WandB with the config
+    
     wandb.init(
         project="diffusion_policy_ddpo",
         config=config_dict
@@ -89,7 +91,7 @@ def main():
         print("Warning: bc_policy.pth not found or disabled. Starting from scratch.")
 
     # Scheduler
-    noise_scheduler = DDPMScheduler(
+    noise_scheduler = DDIMScheduler(
         num_train_timesteps=config.num_diffusion_iters,
         beta_schedule='squaredcos_cap_v2',
         clip_sample=True,
@@ -99,7 +101,7 @@ def main():
     # Environment
     # Note: Use config.batch_size to determine number of parallel envs
     env = SyncVectorEnv([lambda: PushTAdapter() for _ in range(config.batch_size)])
-    
+
     noise_pred_net.train()
 
     optimizer = torch.optim.AdamW(
@@ -122,16 +124,22 @@ def main():
     global_step = 0
 
     for it in range(config.num_pg_iters):
-        if it % 50 == 0 and it > 0:
-            max_score = evaluate_push_t(
+        if it % 20 == 0:
+            avg_max_score, success_rate = evaluate_push_t(
                 noise_pred_net, 
                 noise_scheduler,
                 stats, 
                 device, 
-                num_diffusion_iters=config.num_diffusion_iters
+                num_diffusion_iters=config.num_diffusion_iters,
+                obs_horizon=config.obs_horizon,
+                action_horizon=config.action_horizon,
+                max_steps=config.max_env_steps,
             )
 
-            wandb.log({"eval_max_score": max_score})
+            wandb.log({
+                "eval_max_score": avg_max_score,
+                "eval_success_rate": success_rate
+            })
         
         # ===== Phase 1: collect trajectories (no grad) =====
         time_gen_0 = time.time()
@@ -166,7 +174,10 @@ def main():
             num_batches_per_epoch=config.num_train_chunks,
             epochs=config.epochs,
             clip_eps=config.clip_eps, # Using config value
-            global_step=global_step
+            global_step=global_step,
+            obs_horizon=config.obs_horizon,
+            action_horizon=config.action_horizon,
+            gradient_clip=config.gradient_clip,
         )
         time_opt_1 = time.time()
         optimization_time = time_opt_1 - time_opt_0
