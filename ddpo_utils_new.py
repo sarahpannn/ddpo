@@ -149,7 +149,7 @@ def rollout_ddpo_collect_flat(
     num_diffusion_iters,
     device,
     max_env_steps=100,
-    seed_options=[42, 100000]
+    seed_options=None,
 ):
     vec_env = env
     num_envs = vec_env.num_envs
@@ -169,21 +169,18 @@ def rollout_ddpo_collect_flat(
     # Reset envs
     with torch.no_grad():
         # shared_seed = 1000 + episode_idx 
-        for e in vec_env.envs: 
-            random_seed = np.random.choice(seed_options)
-            ob, info = e.reset(seed=int(random_seed))
-            obs.append(ob)
-            infos.append(info)
-        
-        # print("Seed", random_seed, "first obs[0]:", obs[0])
+        if seed_options is not None:
+            for e in vec_env.envs: 
+                random_seed = np.random.choice(seed_options)
+                ob, info = e.reset(seed=int(random_seed))
+                obs.append(ob)
+                infos.append(info)
 
-        obs = np.array(obs)
-        infos = np.array(infos)
+            obs = np.array(obs)
+            infos = np.array(infos)
 
-        # assert obs are uniform
-        # assert np.all(obs == obs[0]), "Env resets returned non-uniform observations"
-        # assert np.all(infos == infos[0]), "Env resets returned non-uniform infos"
-
+        else: obs, infos = vec_env.reset()
+    
     # [num_envs, obs_horizon, obs_dim]
     obs_history = np.tile(obs[:, None, :], (1, obs_horizon, 1))
     step_idx = 0
@@ -592,7 +589,7 @@ def collect_trajectories_flat(
     device,
     max_env_steps=100,
     episode_idx=0,
-    initialization_seeds=[42, 100000],
+    initialization_seeds=None,
 ):
     """
     Parallel version using a VectorEnv.

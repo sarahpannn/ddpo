@@ -80,7 +80,7 @@ def create_dataset(
     num_diffusion_iters,
     device,
     stats,
-    save_path="critic_dataset.pt"
+    save_path="no.pt"
     ):    
     num_collections = dataset_size // num_examples
     global_episode_idx = 0
@@ -114,8 +114,8 @@ def create_dataset(
         global_episode_idx += num_examples
         all_trajectory_data.extend(trajectory_data)
 
-    torch.save(all_trajectory_data, save_path)
-    print(f"Saved dataset with {len(all_trajectory_data)} samples to {save_path}")
+    # torch.save(all_trajectory_data, save_path)
+    # print(f"Saved dataset with {len(all_trajectory_data)} samples to {save_path}")
     return all_trajectory_data
 
 def train_value_network(
@@ -185,7 +185,7 @@ def main():
     gamma_env = 0.99
     gamma_latent = 0.95
 
-    parallel_envs = 128
+    parallel_envs = 256
     dataset_size = 1000
     num_collections = dataset_size // parallel_envs
     
@@ -241,7 +241,7 @@ def main():
     ).to('cuda' if torch.cuda.is_available() else 'cpu')
 
     optimizer = torch.optim.AdamW(value_network.parameters(), lr=1e-4, weight_decay=1e-4)
-    num_epochs = 5
+    num_epochs = 10
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
     wandb.init(project="pusht-critic")
