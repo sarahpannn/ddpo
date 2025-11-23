@@ -149,6 +149,7 @@ def rollout_ddpo_collect_flat(
     num_diffusion_iters,
     device,
     max_env_steps=100,
+    seed_options=[42, 100000]
 ):
     vec_env = env
     num_envs = vec_env.num_envs
@@ -161,14 +162,15 @@ def rollout_ddpo_collect_flat(
     final_rewards = np.zeros(num_envs, dtype=np.float32)
     active_envs = np.ones(num_envs, dtype=bool)
 
+    # obs, infos = vec_env.reset()
+
     obs, infos = [], []
 
     # Reset envs
     with torch.no_grad():
         # shared_seed = 1000 + episode_idx 
-        seed_options = [100000]
-        random_seed = np.random.choice(seed_options)
-        for e in vec_env.envs:
+        for e in vec_env.envs: 
+            random_seed = np.random.choice(seed_options)
             ob, info = e.reset(seed=int(random_seed))
             obs.append(ob)
             infos.append(info)
@@ -290,7 +292,8 @@ def rollout_ddpo_collect_flat(
                         # Update per-block and per-episode rewards
                         segment_returns[i] += r
                         segment_lengths[i] += 1
-                        current_rewards[i] = max(current_rewards[i], r)
+                        # current_rewards[i] = max(current_rewards[i], r)
+                        current_rewards[i] += r
 
                         # Roll observation history
                         obs_history[i] = np.roll(obs_history[i], -1, axis=0)
@@ -381,6 +384,7 @@ def update_model_efficiently(
     # ---- 0.5 Figure out which slice of the prediction horizon to use ----
     pred_horizon = latents.shape[1]
     use_slice = (action_horizon is not None) and (latents.ndim == 3)
+    use_slice = False
     if use_slice:
         # latents: (N, pred_horizon, action_dim)
         assert action_horizon <= pred_horizon, (
@@ -587,6 +591,8 @@ def collect_trajectories_flat(
     num_diffusion_iters,
     device,
     max_env_steps=100,
+    episode_idx=0,
+    initialization_seeds=[42, 100000],
 ):
     """
     Parallel version using a VectorEnv.
@@ -609,13 +615,14 @@ def collect_trajectories_flat(
             model=model,
             noise_scheduler=noise_scheduler,
             stats=stats,
-            episode_idx=0,  # starting global episode index
+            episode_idx=episode_idx,  # starting global episode index
             obs_horizon=obs_horizon,
             pred_horizon=pred_horizon,
             action_horizon=action_horizon,
             num_diffusion_iters=num_diffusion_iters,
             device=device,
             max_env_steps=max_env_steps,
+            seed_options=initialization_seeds,
         )
 
     returns = torch.tensor(final_rewards, device=device, dtype=torch.float32)

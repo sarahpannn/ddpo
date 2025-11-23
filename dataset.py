@@ -4,6 +4,8 @@ import zarr
 import os
 import gdown
 
+from torch.utils.data import Dataset, DataLoader
+
 def create_sample_indices(
         episode_ends:np.ndarray, sequence_length:int,
         pad_before: int=0, pad_after: int=0):
@@ -145,3 +147,20 @@ class PushTStateDataset(torch.utils.data.Dataset):
         # discard unused observations
         nsample['obs'] = nsample['obs'][:self.obs_horizon,:]
         return nsample
+
+
+class CriticDataset(Dataset):
+    def __init__(self, trajectory_data):
+        self.data = trajectory_data
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        item = self.data[idx]
+        return {
+            "latents": item["latents"].squeeze(0), # Remove the batch dim (1, T, D) -> (T, D)
+            "t": torch.tensor(item["t"], dtype=torch.long),
+            "cond": item["cond"].squeeze(0),       # Remove batch dim if present
+            "target": torch.tensor(item["discounted_reward_to_go"], dtype=torch.float32)
+        }

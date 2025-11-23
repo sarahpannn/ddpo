@@ -243,3 +243,97 @@ class ConditionalUnet1D(nn.Module):
         x = x.moveaxis(-1,-2)
         # (B,T,C)
         return x
+        
+class CNNValueFunction(nn.Module):
+    def __init__(self, 
+        input_dim, 
+        global_cond_dim, 
+        diffusion_step_embed_dim=256, 
+        down_dims=[256, 512], # Fewer levels = "less deep"
+        kernel_size=5, 
+        n_groups=8
+    ):
+        super().__init__()
+        all_dims = [input_dim] + list(down_dims)
+        start_dim = down_dims[0]
+
+        dsed = diffusion_step_embed_dim
+        self.diffusion_step_encoder = nn.Sequential(
+            SinusoidalPosEmb(dsed),
+            nn.Linear(dsed, dsed * 4),
+            nn.Mish(),
+            nn.Linear(dsed * 4, dsed),
+        )
+        cond_dim = dsed + global_cond_dim
+
+        self.down_modules = nn.ModuleList([])
+        in_out = list(zip(all_dims[:-1], all_dims[1:]))
+        
+        for ind, (dim_in, dim_out) in enumerate(in_out):
+            is_last = ind >= (len(in_out) - 1)
+            self.down_modules.append(nn.ModuleList([
+                ConditionalResidualBlock1D(
+                    dim_in, dim_out, cond_dim=cond_dim, 
+                    kernel_size=kernel_size, n_groups=n_groups),
+                ConditionalResidualBlock1D(
+                    dim_out, dim_out, cond_dim=cond_dim, 
+                    kernel_size=kernel_size, n_groups=n_groups),
+                Downsample1d(dim_out) # Always downsample in the encoder
+            ]))
+
+        mid_dim = all_dims[-1]
+        self.mid_modules = nn.ModuleList([
+            ConditionalResidualBlock1D(
+                mid_dim, mid_dim, cond_dim=cond_dim, 
+                kernel_size=kernel_size, n_groups=n_groups
+            ),
+            ConditionalResidualBlock1D(
+                mid_dim, mid_dim, cond_dim=cond_dim, 
+                kernel_size=kernel_size, n_groups=n_groups
+            ),
+        ])
+
+        self.value_head = nn.Sequential(
+            nn.GroupNorm(n_groups, mid_dim),
+            nn.Mish(),
+            nn.AdaptiveAvgPool1d(1), # SQUASH TIME: (B, C, T) -> (B, C, 1)
+            nn.Flatten(),            # (B, C, 1) -> (B, C)
+            nn.Linear(mid_dim, 1)    # (B, C) -> (B, 1)
+        )
+
+        print("Value Net params: {:e}".format(
+            sum(p.numel() for p in self.parameters()))
+        )
+
+    def forward(self, sample, timestep, global_cond=None):
+        """
+        sample: (B, T, input_dim)
+        output: (B, 1)
+        """
+        # Move channel to second dim: (B, T, C) -> (B, C, T)
+        x = sample.moveaxis(-1, -2)
+
+        # --- Handle Timestep & Conditioning (Same as U-Net) ---
+        timesteps = timestep
+        if not torch.is_tensor(timesteps):
+            timesteps = torch.tensor([timesteps], dtype=torch.long, device=sample.device)
+        elif torch.is_tensor(timesteps) and len(timesteps.shape) == 0:
+            timesteps = timesteps[None].to(sample.device)
+        timesteps = timesteps.expand(sample.shape[0])
+
+        global_feature = self.diffusion_step_encoder(timesteps)
+        if global_cond is not None:
+            global_feature = torch.cat([global_feature, global_cond], axis=-1)
+
+        for resnet1, resnet2, downsample in self.down_modules:
+            x = resnet1(x, global_feature)
+            x = resnet2(x, global_feature)
+            x = downsample(x)
+
+        for mid_module in self.mid_modules:
+            x = mid_module(x, global_feature)
+
+        # --- Value Head ---
+        # x is currently [Batch, Channels, Compressed_Time]
+        val = self.value_head(x)
+        return val
