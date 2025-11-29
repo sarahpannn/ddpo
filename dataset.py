@@ -156,11 +156,68 @@ class CriticDataset(Dataset):
     def __len__(self):
         return len(self.data)
 
+    import torch
+import torch.nn as nn
+import numpy as np
+import os
+import random
+import wandb
+from tqdm.auto import tqdm
+from gymnasium.vector import SyncVectorEnv
+from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
+from diffusers.schedulers.scheduling_ddim import DDIMScheduler
+from diffusers.training_utils import EMAModel
+from diffusers.optimization import get_scheduler
+from torch.utils.data import Dataset, DataLoader
+
+from collections import defaultdict
+
+# --- Import your env/network definitions ---
+# (Assumes these files exist in your folder)
+from pusht_env import PushTEnv
+from dataset import PushTStateDataset
+from network import CNNValueFunction, ConditionalUnet1D
+from ddpo_utils_new import collect_trajectories_flat
+
+# ==========================================
+# 1. FIXED CRITIC DATASET
+# ==========================================
+class CriticDataset(Dataset):
+    def __init__(self, trajectory_data):
+        # Determine if we have a dict of arrays (collated) or list of dicts
+        if isinstance(trajectory_data, dict):
+            self.data = trajectory_data
+            self.is_collated = True
+            self.length = len(next(iter(trajectory_data.values())))
+        else:
+            self.data = trajectory_data
+            self.is_collated = False
+            self.length = len(trajectory_data)
+
+    def __len__(self):
+        return self.length
+
     def __getitem__(self, idx):
-        item = self.data[idx]
-        return {
-            "latents": item["latents"].squeeze(0), # Remove the batch dim (1, T, D) -> (T, D)
-            "t": torch.tensor(item["t"], dtype=torch.long),
-            "cond": item["cond"].squeeze(0),       # Remove batch dim if present
-            "target": torch.tensor(item["discounted_reward_to_go"], dtype=torch.float32)
-        }
+        if self.is_collated:
+            # Data is already stacked in dicts
+            item = {key: val[idx] for key, val in self.data.items()}
+        else:
+            # Data is list of dicts
+            item = self.data[idx]
+            
+        # Ensure we return tensors
+        res = {}
+        res['latents'] = torch.as_tensor(item['latents'])
+        res['t'] = torch.as_tensor(item['t'], dtype=torch.long)
+        res['cond'] = torch.as_tensor(item['cond'])
+        
+        # GAE logic saves to 'target', legacy might be 'discounted_reward_to_go'
+        if 'target' in item:
+            res['target'] = torch.as_tensor(item['target'], dtype=torch.float32)
+        elif 'discounted_reward_to_go' in item:
+            res['target'] = torch.as_tensor(item['discounted_reward_to_go'], dtype=torch.float32)
+        else:
+            # Fallback (should not happen with correct create_dataset)
+            res['target'] = torch.tensor(0.0, dtype=torch.float32)
+            
+        return res

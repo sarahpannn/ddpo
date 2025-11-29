@@ -20,7 +20,7 @@ def main():
     action_horizon = 8
     obs_dim = 5
     action_dim = 2
-    num_diffusion_iters = 15
+    num_diffusion_iters = 100
     num_epochs = 50
     dataset_path = "pusht_cchi_v7_replay.zarr.zip"
     

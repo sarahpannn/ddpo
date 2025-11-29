@@ -143,7 +143,7 @@ def main():
         
         # ===== Phase 1: collect trajectories (no grad) =====
         time_gen_0 = time.time()
-        trajectory_data, returns = collect_trajectories_flat(
+        trajectory_data, returns, meta = collect_trajectories_flat(
             env=env,
             model=noise_pred_net,
             noise_scheduler=noise_scheduler,
@@ -159,6 +159,23 @@ def main():
         time_gen_1 = time.time()
         batch_collection_time = time_gen_1 - time_gen_0
         print(f'collected trajectories in {batch_collection_time:.2f} sec')
+
+        if len(meta) > 0:
+            rewards_by_seed = {}
+            for ep in meta:
+                s = ep["init_seed"]
+                rewards_by_seed.setdefault(s, []).append(ep["final_reward"])
+
+            log_dict = {}
+            for s, vals in rewards_by_seed.items():
+                vals = np.array(vals, dtype=np.float32)
+                log_dict[f"train/return_seed_{s}"] = float(vals.mean())
+                log_dict[f"train/max_return_seed_{s}"] = float(vals.max())
+                # Optional: success if reward > some threshold
+                # log_dict[f"train/success_seed_{s}"] = float((vals > THRESH).mean())
+
+            wandb.log(log_dict, step=global_step)
+
 
         # ===== Phase 2: big batched model update =====
         time_opt_0 = time.time()

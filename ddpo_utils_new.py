@@ -150,6 +150,7 @@ def rollout_ddpo_collect_flat(
     device,
     max_env_steps=100,
     seed_options=None,
+    sparse_rewards=False,
 ):
     vec_env = env
     num_envs = vec_env.num_envs
@@ -162,16 +163,17 @@ def rollout_ddpo_collect_flat(
     final_rewards = np.zeros(num_envs, dtype=np.float32)
     active_envs = np.ones(num_envs, dtype=bool)
 
-    # obs, infos = vec_env.reset()
+    init_seeds_for_env = np.zeros(num_envs, dtype=np.int64)
 
     obs, infos = [], []
+    episode_meta = [] 
 
     # Reset envs
     with torch.no_grad():
-        # shared_seed = 1000 + episode_idx 
         if seed_options is not None:
-            for e in vec_env.envs: 
+            for i, e in enumerate(vec_env.envs): 
                 random_seed = np.random.choice(seed_options)
+                init_seeds_for_env[i] = random_seed
                 ob, info = e.reset(seed=int(random_seed))
                 obs.append(ob)
                 infos.append(info)
@@ -179,11 +181,24 @@ def rollout_ddpo_collect_flat(
             obs = np.array(obs)
             infos = np.array(infos)
 
-        else: obs, infos = vec_env.reset()
+        else: 
+            for i, e in enumerate(vec_env.envs):
+                seed = 42 + i
+                ob, info = e.reset(seed=int(seed))
+                init_seeds_for_env[i] = seed
+                obs.append(ob)
+                infos.append(info)
+
+            obs = np.array(obs)
+            infos = np.array(infos)
     
     # [num_envs, obs_horizon, obs_dim]
     obs_history = np.tile(obs[:, None, :], (1, obs_horizon, 1))
     step_idx = 0
+    
+    # ============== NEW: Track env_step per environment ==============
+    env_step_counter = np.zeros(num_envs, dtype=np.int32)
+    # =================================================================
 
     # Move scheduler buffers once
     with torch.no_grad():
@@ -197,10 +212,13 @@ def rollout_ddpo_collect_flat(
         block_active_envs = active_envs.copy()
         if not np.any(block_active_envs):
             break
+        
+        # ============== NEW: Snapshot env_step at start of block ==============
+        block_env_steps = env_step_counter.copy()
+        # ======================================================================
 
         with torch.no_grad():
             # --- Prepare Conditioning ---
-            # Use obs_history for all envs, but we'll only keep entries for block_active_envs
             nobs = normalize_data(obs_history, stats=stats["obs"])
             nobs_t = torch.from_numpy(nobs).to(device, dtype=torch.float32)
             obs_cond = nobs_t.flatten(start_dim=1)  # (B, obs_horizon * obs_dim)
@@ -264,7 +282,7 @@ def rollout_ddpo_collect_flat(
 
             # Slice the 8 actions we actually execute
             start = obs_horizon - 1
-            end = start + action_horizon  # pred_horizon == action_horizon in your setup
+            end = start + action_horizon
             action_seq = action_pred[:, start:end, :]       # (B, action_horizon, action_dim)
 
             # Per-block reward and length (per-env)
@@ -289,7 +307,6 @@ def rollout_ddpo_collect_flat(
                         # Update per-block and per-episode rewards
                         segment_returns[i] += r
                         segment_lengths[i] += 1
-                        # current_rewards[i] = max(current_rewards[i], r)
                         current_rewards[i] += r
 
                         # Roll observation history
@@ -300,6 +317,14 @@ def rollout_ddpo_collect_flat(
                         if dones[i] or step_idx + 1 >= max_env_steps:
                             active_envs[i] = False
                             final_rewards[i] = current_rewards[i]
+
+                            episode_meta.append(
+                                {
+                                    "episode_idx": int(episode_idx + i),
+                                    "init_seed": int(init_seeds_for_env[i]),
+                                    "final_reward": float(current_rewards[i]),
+                                }
+                            )
 
                 step_idx += 1
                 if not np.any(active_envs) or step_idx >= max_env_steps:
@@ -318,258 +343,20 @@ def rollout_ddpo_collect_flat(
                                 "cond": cond_cpu[i : i + 1],
                                 "next_latents": all_next_latents_cpu[t_idx, i : i + 1],
                                 "episode_idx": episode_idx + i,
+                                "env_step": int(block_env_steps[i]),
+                                "init_seed": int(init_seeds_for_env[i]),
+                                "reward": float(segment_returns[i] if t_val == 0 else 0.0),
                             }
                         )
+            
+            # ============== NEW: Increment env_step for active envs ==============
+            for i in range(num_envs):
+                if block_active_envs[i]:
+                    env_step_counter[i] += 1
+            # =====================================================================
 
     # final_rewards is still per full episode (for logging / eval)
-    return trajectory_data, final_rewards
-
-
-# ---------------------------------------------------------------------------
-#  PPO-style update over collected diffusion transitions
-# ---------------------------------------------------------------------------
-
-def update_model_efficiently(
-    model,
-    noise_scheduler,
-    optimizer,
-    trajectory_data,
-    returns,
-    device,
-    lr_scheduler=None,
-    num_batches_per_epoch=10,
-    clip_eps=0.05,   # slightly more conservative than vanilla PPO
-    epochs=5,
-    global_step=0,
-    action_horizon=None,   # NEW: how many actions were actually executed
-    obs_horizon=None,      # NEW: to align with rollout slicing (start = obs_horizon - 1)
-    gradient_clip=0.5
-):
-    """
-    Vectorized PPO-style update over all diffusion steps from all episodes.
-
-    trajectory_data: list of dicts with keys:
-        'latents'      : (1, pred_horizon, action_dim)
-        't'            : int timestep
-        'cond'         : (1, obs_horizon*obs_dim)
-        'next_latents' : (1, pred_horizon, action_dim)
-        'episode_idx'  : int
-    returns: (num_episodes,) tensor on device
-
-    If action_horizon is not None, we only compute log-probs over the
-    executed slice of the horizon:
-        start_idx = (obs_horizon - 1) if obs_horizon is given else 0
-        end_idx   = start_idx + action_horizon
-    """
-    # ---- 0. Flatten data into big tensors on device ----
-    latents = torch.cat([d["latents"] for d in trajectory_data], dim=0).to(device)
-    timesteps = torch.tensor(
-        [d["t"] for d in trajectory_data],
-        dtype=torch.long, device=device
-    )
-    conds = torch.cat([d["cond"] for d in trajectory_data], dim=0).to(device)
-    next_latents = torch.cat(
-        [d["next_latents"] for d in trajectory_data],
-        dim=0
-    ).to(device)
-    episode_indices = torch.tensor(
-        [d["episode_idx"] for d in trajectory_data],
-        dtype=torch.long, device=device
-    )
-    N = latents.shape[0]
-
-    # ---- 0.5 Figure out which slice of the prediction horizon to use ----
-    pred_horizon = latents.shape[1]
-    use_slice = (action_horizon is not None) and (latents.ndim == 3)
-    use_slice = False
-    if use_slice:
-        # latents: (N, pred_horizon, action_dim)
-        assert action_horizon <= pred_horizon, (
-            f"action_horizon ({action_horizon}) > pred_horizon ({pred_horizon})"
-        )
-
-        # If you want literal "take first 8, discard next 8", set obs_horizon = 1
-        if obs_horizon is None:
-            start_idx = 0
-        else:
-            start_idx = obs_horizon - 2
-
-        end_idx = start_idx + action_horizon + 1
-        assert end_idx <= pred_horizon, (
-            f"Slice [{start_idx}:{end_idx}] exceeds pred_horizon={pred_horizon}"
-        )
-    else:
-        start_idx = None
-        end_idx = None
-
-    # ---- 1. Compute per-episode advantages (single normalization) ----
-    adv_per_episode = (returns - returns.mean()) / (returns.std() + 1e-8)  # (E,)
-    advantages = adv_per_episode[episode_indices]                           # (N,)
-    advantages = advantages.detach()
-    advantages = torch.clamp(advantages, -5.0, 5.0)
-
-    # ---- 2. Ensure scheduler buffers on device ----
-    noise_scheduler.alphas_cumprod = noise_scheduler.alphas_cumprod.to(device)
-    noise_scheduler.alphas = noise_scheduler.alphas.to(device)
-    noise_scheduler.betas = noise_scheduler.betas.to(device)
-    noise_scheduler.one = noise_scheduler.one.to(device)
-
-    # ---- 3. Pre-compute old log-probs under current policy (pi_old) ----
-    with torch.no_grad():
-        noise_pred_old = model(
-            sample=latents,
-            timestep=timesteps,
-            global_cond=conds,
-        )
-
-        mu_t_old, var_t_old = compute_posterior_mean_var(
-            noise_scheduler=noise_scheduler,
-            x_t=latents,
-            noise_pred=noise_pred_old,
-            timesteps=timesteps,
-        )
-
-        if use_slice:
-            # Only executed actions along horizon
-            mu_old_exec = mu_t_old[:, :action_horizon + 1, :]
-            next_old_exec = next_latents[:, :action_horizon + 1, :]
-            var_old_exec = var_t_old
-        else:
-            mu_old_exec = mu_t_old
-            next_old_exec = next_latents
-            var_old_exec = var_t_old
-
-        old_log_probs = gaussian_log_prob(
-            x=next_old_exec,
-            mean=mu_old_exec,
-            var=var_old_exec,
-        )
-        old_log_probs = old_log_probs.detach()
-        assert torch.all(torch.isfinite(old_log_probs)), old_log_probs
-
-    # ---- 4. PPO-style update ----
-    model.train()
-    total_loss_val = 0.0
-    total_approx_kl = 0.0
-    num_batches = 0
-
-    batch_size = max(1, N // num_batches_per_epoch)
-
-    for _ in range(epochs):
-        indices = torch.randperm(N, device=device)
-        for start in range(0, N, batch_size):
-            idx = indices[start:start + batch_size]
-
-            b_latents = latents[idx]
-            b_t = timesteps[idx]
-            b_cond = conds[idx]
-            b_next_latents = next_latents[idx]
-            b_adv = advantages[idx]
-            b_old_log_probs = old_log_probs[idx]
-
-            # --- new policy forward ---
-            noise_pred = model(
-                sample=b_latents,
-                timestep=b_t,
-                global_cond=b_cond,
-            )
-
-            mu_t, var_t = compute_posterior_mean_var(
-                noise_scheduler=noise_scheduler,
-                x_t=b_latents,
-                noise_pred=noise_pred,
-                timesteps=b_t,
-            )
-
-            if use_slice:
-                mu_exec = mu_t[:, :action_horizon + 1, :]
-                next_exec = b_next_latents[:, :action_horizon + 1, :]
-                var_exec = var_t
-            else:
-                mu_exec = mu_t
-                next_exec = b_next_latents
-                var_exec = var_t
-
-            new_log_probs = gaussian_log_prob(
-                x=next_exec,
-                mean=mu_exec,
-                var=var_exec,
-            )
-
-            assert b_old_log_probs.shape == new_log_probs.shape
-
-            # --- PPO clipped objective ---
-            raw_log_ratio = new_log_probs - b_old_log_probs           # (B,)
-            raw_log_ratio = torch.nan_to_num(raw_log_ratio, nan=0.0)
-
-            # Clamp in log-space to avoid exp overflow
-            log_ratio = torch.clamp(raw_log_ratio, -10.0, 10.0)
-            ratio = torch.exp(log_ratio)                              # (B,)
-
-            # Approximate KL for logging (as in ddpo-pytorch)
-            approx_kl = 0.5 * torch.mean((new_log_probs - b_old_log_probs) ** 2)
-            total_approx_kl += approx_kl.detach().item()
-
-            wandb.log({
-                "stability/log_ratio_mean": raw_log_ratio.mean().item(),
-                "stability/log_ratio_max": raw_log_ratio.max().item(),
-                "stability/log_ratio_min": raw_log_ratio.min().item(),
-                "stability/log_ratio_std": raw_log_ratio.std().item(),
-                "stability/ratio_mean": ratio.mean().item(),
-                "stability/ratio_max": ratio.max().item(),
-                "stability/ratio_min": ratio.min().item(),
-                "stability/ratio_std": ratio.std().item(),
-                "stability/approx_kl": approx_kl.item(),
-                "global_step": global_step,
-            })
-
-            assert torch.all(torch.isfinite(log_ratio)), (
-                f"log_ratio is unstable.\nMin: {log_ratio.min().item()}, "
-                f"Max: {log_ratio.max().item()}"
-            )
-            assert torch.all(torch.isfinite(ratio)), (
-                f"ratio is unstable.\nMin: {ratio.min().item()}, "
-                f"Max: {ratio.max().item()}"
-            )
-
-            b_adv = torch.clamp(b_adv, -5.0, 5.0)
-
-            surr1 = ratio * b_adv
-            surr2 = torch.clamp(ratio, 1.0 - clip_eps, 1.0 + clip_eps) * b_adv
-            loss = -torch.min(surr1, surr2).mean()
-
-            optimizer.zero_grad()
-            loss.backward()
-
-            # Gradient norm logging + clipping
-            total_norm = 0.0
-            for p in model.parameters():
-                if p.grad is not None:
-                    param_norm = p.grad.detach().data.norm(2)
-                    total_norm += param_norm.item() ** 2
-            total_norm = total_norm ** 0.5
-
-            torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_clip)
-            optimizer.step()
-
-            total_loss_val += float(loss.item())
-            num_batches += 1
-
-            wandb.log({
-                "gradients/total_norm": total_norm,
-                "ppo/loss": loss.item(),
-                "global_step": global_step,
-            })
-            global_step += 1
-
-    avg_loss = total_loss_val / max(1, num_batches)
-    avg_approx_kl = total_approx_kl / max(1, num_batches)
-
-    if lr_scheduler is not None:
-        lr_scheduler.step()
-
-    return avg_loss, avg_approx_kl, global_step
-
+    return trajectory_data, final_rewards, episode_meta
 
 
 # ---------------------------------------------------------------------------
@@ -590,6 +377,7 @@ def collect_trajectories_flat(
     max_env_steps=100,
     episode_idx=0,
     initialization_seeds=None,
+    sparse_rewards=False,
 ):
     """
     Parallel version using a VectorEnv.
@@ -607,7 +395,7 @@ def collect_trajectories_flat(
 
     # Collect one episode per env in parallel
     with torch.no_grad():
-        trajectory_data, final_rewards = rollout_ddpo_collect_flat(
+        trajectory_data, final_rewards, meta = rollout_ddpo_collect_flat(
             env=env,
             model=model,
             noise_scheduler=noise_scheduler,
@@ -620,7 +408,8 @@ def collect_trajectories_flat(
             device=device,
             max_env_steps=max_env_steps,
             seed_options=initialization_seeds,
+            sparse_rewards=sparse_rewards,
         )
 
     returns = torch.tensor(final_rewards, device=device, dtype=torch.float32)
-    return trajectory_data, returns
+    return trajectory_data, returns, meta

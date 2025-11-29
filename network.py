@@ -313,6 +313,9 @@ class CNNValueFunction(nn.Module):
         # Move channel to second dim: (B, T, C) -> (B, C, T)
         x = sample.moveaxis(-1, -2)
 
+        if x.ndim == 4 and x.shape[1] == 1:
+            x = x.squeeze(1)
+
         # --- Handle Timestep & Conditioning (Same as U-Net) ---
         timesteps = timestep
         if not torch.is_tensor(timesteps):
@@ -322,8 +325,19 @@ class CNNValueFunction(nn.Module):
         timesteps = timesteps.expand(sample.shape[0])
 
         global_feature = self.diffusion_step_encoder(timesteps)
+
+        if global_cond.ndim == 3 and global_cond.shape[1] == 1:
+            global_cond = global_cond.squeeze(1)
+
+        if global_feature.ndim == 3 and global_cond.ndim == 2:
+            global_cond = global_cond.unsqueeze(1).expand(-1, global_feature.shape[1], -1)
+
+        # assert global_cond.shape == global_feature.shape, f"Conditioning shape mismatch. {global_cond.shape} vs {global_feature.shape}"
+
         if global_cond is not None:
             global_feature = torch.cat([global_feature, global_cond], axis=-1)
+
+        # print(f"x shape: {x.shape}, global_feature shape: {global_feature.shape}")
 
         for resnet1, resnet2, downsample in self.down_modules:
             x = resnet1(x, global_feature)
@@ -332,8 +346,27 @@ class CNNValueFunction(nn.Module):
 
         for mid_module in self.mid_modules:
             x = mid_module(x, global_feature)
+            
+        # --------------------------------------
 
         # --- Value Head ---
         # x is currently [Batch, Channels, Compressed_Time]
         val = self.value_head(x)
         return val
+
+class StateIndependentValueWrapper(nn.Module):
+    """
+    Wraps a value network with the same interface as CNNValueFunction
+    but makes it independent of the diffusion latents.
+
+    V(s, t) = base_value_net(sample = 0, timestep=t, global_cond=cond)
+    """
+
+    def __init__(self, base_value_net: nn.Module):
+        super().__init__()
+        self.base = base_value_net
+
+    def forward(self, sample, timestep, global_cond):
+        # Ignore actual latents: use a constant tensor with same shape
+        zeros = torch.zeros_like(sample)
+        return self.base(sample=zeros, timestep=timestep, global_cond=global_cond)

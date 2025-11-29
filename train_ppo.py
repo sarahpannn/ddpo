@@ -7,6 +7,7 @@ import time
 import math
 import os
 import random
+import torch.nn as nn
 
 from gymnasium.vector import SyncVectorEnv
 from torch.optim.lr_scheduler import LambdaLR
@@ -14,7 +15,7 @@ from diffusers.schedulers.scheduling_ddim import DDIMScheduler
 
 from pusht_env import PushTAdapter
 from dataset import PushTStateDataset
-from network import ConditionalUnet1D, CNNValueFunction
+from network import ConditionalUnet1D, CNNValueFunction, StateIndependentValueWrapper
 from ddpo_utils_new import (
     collect_trajectories_flat,
     gaussian_log_prob,
@@ -41,38 +42,40 @@ def ensure_scheduler_buffers_on_device(noise_scheduler, device):
 def main():
     # 1. Define Hyperparameters in a Dictionary (very similar to train_ddpo)
     config_dict = {
-        "pred_horizon": 16,
+        "pred_horizon": 64,
         "obs_horizon": 2,
         "action_horizon": 8,
         "obs_dim": 5,
         "action_dim": 2,
-        "num_diffusion_iters": 15,
+        "num_diffusion_iters": 100,
         "num_pg_iters": 1000,
-        "batch_size": 128, 
+        "batch_size": 256, 
         "max_env_steps": 100,
         "num_train_chunks": 2,
         "epochs": 1,  
         "actor_lr": 3e-7,
-        "critic_lr": 1e-5,
+        "critic_lr": 1e-6,
         "weight_decay": 1e-6,
-        "critic_weight_decay": 1e-4,
+        "critic_weight_decay": 1e-6,
         "clip_eps": 0.15,
-        "warmup_ratio": 0.05,
+        "warmup_ratio": 0.1,
         "dataset_path": "pusht_cchi_v7_replay.zarr.zip",
         "seed": 42,
         "load_pretrained_actor": True,
         "load_pretrained_critic": True,
-        "critic_path": "critic_network.pth",
+        "critic_path": "critic_network_best.pth",
         "actor_bc_path": "bc_policy.pth",
         "gradient_clip": 0.5,
-        "gamma_env": 0.95,
+        "gamma_env": 0.99,
         "gamma_latent": 0.95,
-        "gae_lambda": 0.90,
-        "value_coef": 0.5,
+        "gae_lambda": 0.95,
+        "value_coef": 0.1,
         "project_name": "pusht-ddpo-ppo",
         "initialization_seeds": None,
         "use_kl": True,
-        "kl_coef": 0.01,
+        "kl_coef": 100,
+        "value_condition_on_latent": True,
+        "pg_last_k_diffusion_steps": 5,
     }
 
     # 2. Initialize W&B
@@ -124,6 +127,7 @@ def main():
     value_network = CNNValueFunction(
         input_dim=config.action_dim,
         global_cond_dim=config.obs_dim * config.obs_horizon,
+        down_dims=[128, 256, 512, 1024]
     ).to(device)
     wandb.watch(value_network, log="all", log_freq=10)
 
@@ -133,6 +137,12 @@ def main():
         value_network.load_state_dict(critic_state)
     else:
         print("Critic starting from scratch (or offline training path not found).")
+
+    if not config.value_condition_on_latent:
+        print("Using STATE-ONLY critic (independent of diffusion latents).")
+        value_network = StateIndependentValueWrapper(value_network).to(device)
+    else:
+        print("Using LATENT-CONDITIONED critic (depends on diffusion latents).")
 
     # Scheduler for diffusion timesteps
     noise_scheduler = DDIMScheduler(
@@ -195,7 +205,7 @@ def main():
 
         # ===== Phase 1: Collect trajectories =====
         time_gen_0 = time.time()
-        trajectory_data, returns = collect_trajectories_flat(
+        trajectory_data, returns, meta = collect_trajectories_flat(
             env=env,
             model=noise_pred_net,
             noise_scheduler=noise_scheduler,
@@ -214,6 +224,23 @@ def main():
         batch_collection_time = time_gen_1 - time_gen_0
         print(f"Collected trajectories in {batch_collection_time:.2f} sec")
 
+        if len(meta) > 0:
+            rewards_by_seed = {}
+            for ep in meta:
+                s = ep["init_seed"]
+                rewards_by_seed.setdefault(s, []).append(ep["final_reward"])
+
+            log_dict = {}
+            for s, vals in rewards_by_seed.items():
+                vals = np.array(vals, dtype=np.float32)
+                log_dict[f"train/return_seed_{s}"] = float(vals.mean())
+                # log_dict[f"train/max_return_seed_{s}"] = float(vals.max())
+                log_dict[f"global_step"] = global_step
+                # Optional: success if reward > some threshold
+                # log_dict[f"train/success_seed_{s}"] = float((vals > THRESH).mean())
+
+            wandb.log(log_dict)
+
         # Attach critic values + GAE-based advantages/returns
         trajectory_data = attach_gae_to_trajectories(
             trajectory_data=trajectory_data,
@@ -221,7 +248,6 @@ def main():
             current_episode_idx_start=global_episode_idx,
             value_network=value_network,
             device=device,
-            num_diffusion_iters=config.num_diffusion_iters,
             gamma_env=config.gamma_env,
             gamma_latent=config.gamma_latent,
             gae_lambda=config.gae_lambda,
@@ -263,11 +289,39 @@ def main():
             device=device,
         )  # (N,)
 
+        K = getattr(config, "pg_last_k_diffusion_steps", 0)
+        if K is not None and K > 0:
+            noise_scheduler.set_timesteps(config.num_diffusion_iters, device=device)
+            all_ts = noise_scheduler.timesteps.to(device=timesteps.device)  # (T,)
+            K = min(K, all_ts.shape[0])
+
+            last_k_ts = all_ts[-K:]  # the last K diffusion timesteps
+
+            # Build boolean mask: keep entries whose t is in last_k_ts
+            # (timesteps is shape (N,), last_k_ts is (K,))
+            mask = (timesteps[:, None] == last_k_ts[None, :]).any(dim=1)
+
+            # Apply mask consistently to all tensors
+            latents = latents[mask]
+            next_latents = next_latents[mask]
+            timesteps = timesteps[mask]
+            conds = conds[mask]
+            advantages = advantages[mask]
+            target_returns = target_returns[mask]
+
+            print(
+                f"PG masking: keeping {mask.sum().item()} / {mask.numel()} "
+                f"diffusion states (last {K} steps)."
+            )
+
         # Normalize advantages (standard PPO)
-        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+        # advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+        # target_returns = (target_returns - target_returns.mean()) / (target_returns.std() + 1e-8)
 
         N = latents.shape[0]
         print(f"Total trajectory samples: {N}")
+
+        print(f"target_returns: mean={target_returns.mean():.2f}, std={target_returns.std():.2f}, min={target_returns.min():.2f}, max={target_returns.max():.2f}")
 
         # ===== Phase 2: Compute old log-probs =====
         ensure_scheduler_buffers_on_device(noise_scheduler, device)
@@ -306,6 +360,8 @@ def main():
         total_value_loss_val = 0.0
         total_approx_kl = 0.0
         num_batches = 0
+
+        critic_criterion = nn.MSELoss()
 
         # Mini-batch size based on N and num_train_chunks
         batch_size = max(1, N // config.num_train_chunks)
@@ -367,11 +423,12 @@ def main():
                 assert torch.all(torch.isfinite(log_ratio)), "log_ratio has NaNs/inf."
                 assert torch.all(torch.isfinite(ratio)), "ratio has NaNs/inf."
 
-                b_adv = torch.clamp(b_adv, -5.0, 5.0)
+                # b_adv = torch.clamp(b_adv, -5.0, 5.0)
 
                 surr1 = ratio * b_adv
                 surr2 = torch.clamp(ratio, 1.0 - config.clip_eps, 1.0 + config.clip_eps) * b_adv
                 policy_loss = -torch.min(surr1, surr2).mean()
+                # policy_loss = torch.min(surr1, surr2).mean() # lol what if...
 
                 # --- Critic loss ---
                 values_pred = value_network(
@@ -380,7 +437,10 @@ def main():
                     global_cond=b_cond,
                 ).squeeze(-1)
 
-                value_loss = 0.5 * (values_pred - b_ret).pow(2).mean()
+                # print(f"values_pred: mean={values_pred.mean():.2f}, std={values_pred.std():.2f}, min={values_pred.min():.2f}, max={values_pred.max():.2f}")
+                # print(f"b_ret: mean={b_ret.mean():.2f}, std={b_ret.std():.2f}")
+
+                value_loss = critic_criterion(values_pred, b_ret)
 
                 loss = policy_loss + config.value_coef * value_loss
 
